@@ -1,0 +1,21 @@
+# 用户私有数据
+raw/
+db/
+setting/
+
+# Python缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Streamlit缓存
+.streamlit/
+
+# Windows系统文件
+Thumbs.db
+Desktop.ini
+
+# 日志
+*.log
