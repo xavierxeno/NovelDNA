@@ -56,7 +56,7 @@ git clone https://github.com/xavierxeno/NovelDNA.git
 cd NovelDNA
 ```
 
-2. **首次使用：双击 `first_do.bat`**，自动安装全部 python 依赖
+2. **首次使用：双击 `do_first.bat`**，自动安装全部 python 依赖
 3. 依赖安装完成后，双击 `启动.bat`，自动打开浏览器访问 `http://localhost:8501`
 
 > Linux/Mac 用户：手动执行 `pip install -r requirements.txt`，再执行 `streamlit run app.py`
