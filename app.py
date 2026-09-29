@@ -4,13 +4,12 @@ import ollama
 from openai import OpenAI
 import os, random, shutil
 from pathlib import Path
+import re
 
 st.set_page_config(page_title="作品语料检索与风格解析器", layout="wide")
-
 # ========== 全局连接 ==========
 client = chromadb.PersistentClient(path="./chroma_db")
 EMBED_MODEL = "bge-m3"
-
 # ========== 基础工具函数 ==========
 def list_authors():
     raw = Path("./raw")
@@ -131,6 +130,90 @@ def delete_author(author, delete_raw=False):
         if rd.exists():
             shutil.rmtree(rd)
 
+def load_skill(skill_dir:str):
+    """加载skill，读取SKILL.md，提取system prompt，读取模板文件"""
+    skill_root = Path(skill_dir)
+    skill_md = skill_root / "SKILL.md"
+    if not skill_md.exists():
+        raise FileNotFoundError(f"找不到skill配置：{skill_md}，请确认skill目录创建完成")
+    skill_text = skill_md.read_text(encoding="utf-8")
+    # 提取System Prompt
+    sys_pat = re.search(r"## System Prompt\s*\n(.*?)(?=\n##|\Z)", skill_text, re.DOTALL)
+    system_prompt = sys_pat.group(1).strip() if sys_pat else ""
+    # 提取模板路径
+    tp_pat = re.search(r"## Template Path\s*\n(.*?)(?=\n##|\Z)", skill_text, re.DOTALL)
+    template_rel_path = tp_pat.group(1).strip() if tp_pat else ""
+    template_file = skill_root / template_rel_path
+    if not template_file.exists():
+        raise FileNotFoundError(f"找不到模板文件 {template_file}")
+    template_content = template_file.read_text(encoding="utf-8")
+    return system_prompt, template_content
+
+#世界观分析函数
+def extract_worldbuilding(author, book_title, distill_model_type,
+                          api_client=None, api_model=None, ollama_model=None):
+    # 加载世界观skill
+    system_prompt, world_template = load_skill("./skill/worldbuilding-skill")
+    # 读取该作品向量库
+    col = get_collection(author)
+    res = col.get(where={"book_title": book_title}, include=["documents"])
+    docs = res.get("documents", [])
+    if not docs:
+        raise Exception(f"《{book_title}》还未上传入库，请先上传文本")
+    # 采样原文片段，最多8段，控制总长度
+    full_text = "\n".join(docs)
+    step = max(3000, len(full_text) // 8)
+    segs = []
+    pos = 0
+    while pos < len(full_text):
+        segs.append(full_text[pos:pos+3000])
+        pos += step
+    sample_segs = segs[:8]
+    corpus_text = "\n====原文片段分割线====\n".join(sample_segs)[:20000]
+    user_msg = f"【原文片段】\n{corpus_text}\n\n【输出模板】\n{world_template}\n\n填充模板，生成《{book_title}》世界观设定文档。"
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_msg}
+    ]
+    # 区分云端API / Ollama本地模型，和你现有逻辑对齐
+    if distill_model_type == "api":
+        resp = api_client.chat.completions.create(model=api_model, messages=messages)
+        return resp.choices[0].message.content
+    else:
+        resp = ollama.chat(model=ollama_model, messages=messages)
+        return resp["message"]["content"]
+# 角色资料卡分析函数（从skill加载prompt和模板）
+def extract_character_card(author, book_title, character_name, distill_model_type,
+                            api_client=None, api_model=None, ollama_model=None):
+    # 加载角色卡skill
+    system_prompt, char_template = load_skill("./skill/character-card-skill")
+
+    # 读取该作品向量库
+    col = get_collection(author)
+    # RAG检索和该角色相关片段
+    query_emb = ollama.embeddings(model=EMBED_MODEL, prompt=character_name)["embedding"]
+    rag_res = col.query(query_embeddings=[query_emb], n_results=6,
+                        where={"book_title": book_title})
+    rag_docs = rag_res["documents"][0]
+    if not rag_docs:
+        raise Exception(f"《{book_title}》里没检索到和「{character_name}」相关的片段")
+    corpus_text = "\n====原文片段分割线====\n".join(rag_docs)[:15000]
+
+    user_msg = (f"角色名：{character_name}，作品《{book_title}》\n"
+                f"【原文片段】\n{corpus_text}\n\n"
+                f"【输出模板】\n{char_template}\n\n按模板生成角色资料卡。")
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_msg}
+    ]
+    # 区分云端API / Ollama本地模型
+    if distill_model_type == "api":
+        resp = api_client.chat.completions.create(model=api_model, messages=messages)
+        return resp.choices[0].message.content
+    else:
+        resp = ollama.chat(model=ollama_model, messages=messages)
+        return resp["message"]["content"]
+
 # ==========分析函数（支持单本/全局两种模式） ==========
 def distill_author(author, mode, book_title, distill_model_type,
                    api_client=None, api_model=None, ollama_model=None):
@@ -160,7 +243,6 @@ def distill_author(author, mode, book_title, distill_model_type,
             parts.append(read_text_file(f))
         full_text = "\n".join(parts)
         dna_filename = "Writing-DNA.md"
-
     # 均匀采样最多 4 段，共 12000 字
     text_len = len(full_text)
     step = max(2000, text_len // 4)
@@ -171,7 +253,6 @@ def distill_author(author, mode, book_title, distill_model_type,
         pos += step
     sample = segs[:4]
     corpus = "\n====片段分隔====\n".join(sample)[:12000]
-
     # ---- 2. 加载模板 ----
     tpl_root = Path("./skill/writing-dna-skill/templates/author-corpus/zh")
     tpl_files = ["Writing-DNA.md", "语言DNA.md", "文章结构模板.md",
@@ -181,7 +262,6 @@ def distill_author(author, mode, book_title, distill_model_type,
         fp = tpl_root / t
         if fp.exists():
             tpl_text += f"\n====模板:{t}====\n{fp.read_text(encoding='utf-8')}\n"
-
     sys_prompt = """你是文学风格分析器。基于原文片段，严格依照模板生成Writing-DNA。
 要求：
 1. 只输出语言层风格规则（句式、节奏、词汇、修辞、叙事视角、对话写法）
@@ -190,7 +270,6 @@ def distill_author(author, mode, book_title, distill_model_type,
     user_prompt = f"【原文片段】\n{corpus}\n\n【输出模板】\n{tpl_text}\n\n按模板输出。"
     messages = [{"role":"system","content":sys_prompt},
                 {"role":"user","content":user_prompt}]
-
     # ---- 3. 调用模型 ----
     if distill_model_type == "api":
         resp = api_client.chat.completions.create(model=api_model, messages=messages)
@@ -198,12 +277,10 @@ def distill_author(author, mode, book_title, distill_model_type,
     else:
         resp = ollama.chat(model=ollama_model, messages=messages)
         dna_content = resp["message"]["content"]
-
     # ---- 4. 保存DNA ----
     out_dir = Path("./setting") / author
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / dna_filename).write_text(dna_content, encoding="utf-8")
-
     # 全分析才重新入库；单分析素材已在库中，不重复入库
     if mode == "author":
         chunk_count = ingest_author(author, book_title="(全部作品)")
@@ -234,7 +311,7 @@ def fuse_authors(author_a, author_b, new_name, distill_model_type,
                                 source_dirs=[Path("./raw")/author_a, Path("./raw")/author_b])
     return new_dna, chunk_count
 
-# ========== 侧边栏 ==========
+# ========== 侧边栏（全部控制面板都放这里！） ==========
 with st.sidebar:
     st.header("📖 多作者小说RAG")
     PROVIDERS = {
@@ -273,23 +350,19 @@ with st.sidebar:
             work_model = st.selectbox("本地Ollama模型", local_models)
         except Exception:
             st.error("Ollama未启动"); work_model = None
-
     authors = list_authors()
     dna_authors = list_dna_authors()
-
     st.subheader("🎯 当前写作对象")
     cur_author = None
     if dna_authors:
         cur_author = st.selectbox("选择作者", dna_authors)
     else:
         st.info("还没有任何DNA，请分析")
-
     cur_book = "全部作品"
     if cur_author:
         books = list_books_of_author(cur_author)
         if books:
             cur_book = st.selectbox("限定作品", ["全部作品"] + books)
-
     st.divider()
     st.subheader("📤 上传文本")
     combined = []
@@ -325,7 +398,6 @@ with st.sidebar:
                     s.update(label="❌ 失败", state="error"); st.error(str(e))
     elif uploaded and target_author and not upload_book.strip():
         st.warning("请先填作品名再上传")
-
     st.divider()
     st.subheader("🧪 分析")
     distill_mode = st.radio("分析模式", ["作者风格", "单本风格"], horizontal=True)
@@ -339,18 +411,18 @@ with st.sidebar:
                 st.warning("该作者还没有入库的书，请先上传并入库")
             else:
                 distill_book = st.selectbox("选要分析的书", books_for_distill)
-        if st.button("开分析"):
+        if st.button("开始分析"):
             with st.status("分析中...", expanded=True) as s:
                 try:
                     if use_api:
                         _, n = distill_author(sel_distill,
-                                              mode="book" if distill_mode=="单本书专属风格" else "author",
+                                              mode="book" if distill_mode=="单本风格" else "author",
                                               book_title=distill_book,
                                               distill_model_type="api",
                                               api_client=api_client, api_model=api_model)
                     else:
                         _, n = distill_author(sel_distill,
-                                              mode="book" if distill_mode=="单本书专属风格" else "author",
+                                              mode="book" if distill_mode=="单本风格" else "author",
                                               book_title=distill_book,
                                               distill_model_type="local",
                                               ollama_model=work_model)
@@ -358,8 +430,127 @@ with st.sidebar:
                     st.rerun()
                 except Exception as e:
                     s.update(label="❌ 失败", state="error"); st.error(str(e))
-
     st.divider()
+        # ===== 世界观模块 =====
+    st.subheader("🌍 世界观设定整理")
+    # 初始化session状态标记
+    if "show_world_doc" not in st.session_state:
+        st.session_state.show_world_doc = False
+
+    if cur_book and cur_book != "全部作品":
+        if st.button("📄 生成本书世界观设定集", help="从当前选中作品语料提取世界观，自动保存md文件"):
+            with st.status("正在解析原文，提取世界观设定...", expanded=True) as status:
+                try:
+                    if use_api:
+                        world_result = extract_worldbuilding(
+                            cur_author, cur_book, "api",
+                            api_client=api_client,
+                            api_model=api_model
+                        )
+                    else:
+                        world_result = extract_worldbuilding(
+                            cur_author, cur_book, "local",
+                            ollama_model=work_model
+                        )
+                    # 写入md文件
+                    save_dir = Path("./setting") / cur_author
+                    save_dir.mkdir(parents=True, exist_ok=True)
+                    save_file = save_dir / f"世界观_{cur_book}.md"
+                    save_file.write_text(world_result, encoding="utf-8")
+                    status.update(label="✅ 世界观整理完成，文件已保存", state="complete")
+                    st.session_state.show_world_doc = True #生成完自动打开
+                except Exception as err:
+                    status.update(label="❌ 任务失败", state="error")
+                    st.error(f"错误：{str(err)}")
+
+        # 读取已保存世界观文档按钮
+        world_md_path = Path("./setting") / cur_author / f"世界观_{cur_book}.md"
+        if world_md_path.exists():
+            if st.button("📖 读取已保存世界观文档"):
+                # 切换显示状态
+                st.session_state.show_world_doc = not st.session_state.show_world_doc
+
+            # expander折叠框，支持手动收起
+            with st.expander("📖 世界观文档", expanded=st.session_state.show_world_doc):
+                load_text = world_md_path.read_text(encoding="utf-8")
+                st.markdown(load_text)
+        else:
+            st.info("💡 暂未找到本书的世界观文档，请先生成")
+    else:
+        st.info("💡 请先在【限定作品】下拉框选中目标书籍，再生成世界观")
+    
+    # ===== 角色资料卡模块 =====
+    st.divider()
+    st.subheader("👤 角色资料卡")
+    if "show_char_card" not in st.session_state:
+        st.session_state.show_char_card = False
+
+    if cur_book and cur_book != "全部作品":
+        char_save_dir = Path("./setting") / cur_author
+        char_save_dir.mkdir(parents=True, exist_ok=True)
+
+        # 自动扫描当前本书已经存在的角色md，提取角色名
+        existed_char_list = []
+        for f in char_save_dir.glob(f"角色_{cur_book}_*.md"):
+            filename = f.name
+            prefix = f"角色_{cur_book}_"
+            if filename.startswith(prefix) and filename.endswith(".md"):
+                char_name_parsed = filename[len(prefix):-3]
+                existed_char_list.append(char_name_parsed)
+        existed_char_list = sorted(existed_char_list)
+
+        # 下拉选择已有角色 + 手动输入框
+        select_opt = ["（新建角色，手动输入）"] + existed_char_list
+        selected_char = st.selectbox("📋 已生成角色列表", options=select_opt, key="char_select_box")
+        if selected_char != "（新建角色，手动输入）":
+            char_name = selected_char
+        else:
+            char_name = st.text_input("角色名称", placeholder="输入书中角色名字", key="char_name_input")
+
+        char_file_path = char_save_dir / f"角色_{cur_book}_{char_name.strip()}.md"
+
+        if char_name.strip():
+            col_gen, col_del = st.columns(2)
+            with col_gen:
+                if st.button("👤 生成角色资料卡", help="从当前作品语料提取角色信息，保存md"):
+                    with st.status("正在检索原文，生成角色资料...", expanded=True) as status:
+                        try:
+                            if use_api:
+                                char_result = extract_character_card(
+                                    cur_author, cur_book, char_name.strip(), "api",
+                                    api_client=api_client, api_model=api_model
+                                )
+                            else:
+                                char_result = extract_character_card(
+                                    cur_author, cur_book, char_name.strip(), "local",
+                                    ollama_model=work_model
+                                )
+                            save_file = char_save_dir / f"角色_{cur_book}_{char_name.strip()}.md"
+                            save_file.write_text(char_result, encoding="utf-8")
+                            status.update(label="✅ 角色资料卡生成完成，已保存", state="complete")
+                            st.session_state.show_char_card = True
+                        except Exception as err:
+                            status.update(label="❌ 任务失败", state="error")
+                            st.error(f"错误：{str(err)}")
+            with col_del:
+                if char_file_path.exists():
+                    if st.button("🗑️ 删除角色卡", help="永久删除该角色md文件", type="secondary"):
+                        char_file_path.unlink()
+                        st.warning(f"已删除：{char_name} 的角色资料卡，请刷新页面更新角色列表")
+                        st.session_state.show_char_card = False
+
+            if char_file_path.exists():
+                if st.button("📖 读取已保存角色资料卡", key="read_char_btn"):
+                    st.session_state.show_char_card = not st.session_state.show_char_card
+                with st.expander("👤 角色资料卡文档", expanded=st.session_state.show_char_card):
+                    char_text = char_file_path.read_text(encoding="utf-8")
+                    st.markdown(char_text)
+            else:
+                st.info("💡 暂无该角色资料卡，请先生成")
+    else:
+        st.info("💡 请先在【限定作品】下拉框选中目标书籍")
+
+    # ===== 比较两个作者 =====
     st.subheader("🔀 比较两个作者")
     if len(dna_authors) >= 2:
         a1 = st.selectbox("作者1", dna_authors, key="fuse_a")
@@ -378,8 +569,8 @@ with st.sidebar:
                     st.rerun()
                 except Exception as e:
                     s.update(label="❌ 失败", state="error"); st.error(str(e))
-
     st.divider()
+    # ===== 删除模块=====
     st.subheader("🗑️ 删除")
     if dna_authors:
         del_target = st.selectbox("选择要删除的", dna_authors, key="del_target")
@@ -387,9 +578,10 @@ with st.sidebar:
         if st.button("确认删除", type="primary"):
             delete_author(del_target, delete_raw=del_raw)
             st.success(f"已删除 {del_target}"); st.rerun()
-
     st.divider()
+    # ===== 检索数量滑块 =====
     retrieve_cnt = st.slider("检索片段数", 1, 8, 2)
+# ========== 侧边栏 END ==========
 
 # ========== 主页面 ==========
 st.title("📝作品语料检索与风格解析器")
@@ -405,6 +597,7 @@ if "messages" not in st.session_state:
 conv_key = f"{cur_author}::{cur_book}"
 if conv_key not in st.session_state["messages"]:
     st.session_state.messages[conv_key] = []
+
 for msg in st.session_state.messages[conv_key]:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -416,14 +609,12 @@ if user_input and cur_author:
     st.session_state.messages[conv_key].append({"role":"user","content":user_input})
     dna = load_dna(cur_author, cur_book)
     col = get_collection(cur_author)
-
     # 手动用 bge-m3 生成 query 向量（避免 chroma 自带 embedding 维度不匹配）
     query_emb = ollama.embeddings(model=EMBED_MODEL, prompt=user_input)["embedding"]
     query_kwargs = {"query_embeddings":[query_emb], "n_results":retrieve_cnt}
     if cur_book != "全部作品":
         query_kwargs["where"] = {"book_title": cur_book}
     res = col.query(**query_kwargs)
-
     # 片段去重
     docs_raw = res["documents"][0] if res["documents"] else []
     unique_docs, seen_text = [], set()
@@ -433,7 +624,6 @@ if user_input and cur_author:
             seen_text.add(key)
             unique_docs.append(doc)
     retrieved_text = "\n\n".join(unique_docs)
-
     book_note = "" if cur_book == "全部作品" else f"\n【本次只参考《{cur_book}》，禁止引入其他作品人物/设定】"
     system_prompt = f"""【硬性规则，优先级最高】
 1. 只用下方参考片段内容，禁止引入其他作品、网络资料或脑补设定
@@ -445,7 +635,6 @@ if user_input and cur_author:
 {retrieved_text}
 """
     msgs = [{"role":"system","content":system_prompt}] + st.session_state.messages[conv_key]
-
     response = ""
     with st.chat_message("assistant"):
         placeholder = st.empty()
